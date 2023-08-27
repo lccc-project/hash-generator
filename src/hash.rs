@@ -174,3 +174,25 @@ impl<const C: usize, const D: usize> core::hash::Hasher for SipHasher<C, D> {
         };
     }
 }
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HashBytes<S>(pub S);
+
+impl<S: AsRef<str>> core::hash::Hash for HashBytes<S> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        state.write(self.0.as_ref().as_bytes())
+    }
+}
+
+impl<S: AsRef<str>> core::ops::Deref for HashBytes<S> {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl<S: AsMut<str> + AsRef<str>> core::ops::DerefMut for HashBytes<S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut()
+    }
+}

@@ -1,5 +1,63 @@
 use crate::hash::SipHasher;
-use core::hash::{Hash, Hasher};
+use core::{
+    hash::{BuildHasher, Hash, Hasher},
+    ops::Deref,
+};
+
+use alloc::vec::Vec;
+
+pub struct HashFnStats<T, const C: usize, const D: usize> {
+    field_maps: Vec<Vec<T>>,
+    global_key: u64,
+    local_key: u64,
+    tsize: usize,
+    collision_density: f64,
+}
+
+impl<T, const C: usize, const D: usize> HashFnStats<T, C, D> {
+    /// Returns an iterator over the table indicies and elements for each populated key.
+    pub fn key_val_map(&self) -> impl Iterator<Item = (u32, &[T])> {
+        self.field_maps
+            .iter()
+            .map(Deref::deref)
+            .zip(0u32..)
+            .map(|(r, v)| (v, r))
+            .filter(|(r, v)| v.len() != 0)
+    }
+
+    /// Returns an iterator over the table indicies and elements for each key with a collision.
+    pub fn collision_map(&self) -> impl Iterator<Item = (u32, &[T])> {
+        self.field_maps
+            .iter()
+            .map(Deref::deref)
+            .zip(0u32..)
+            .map(|(r, v)| (v, r))
+            .filter(|(r, v)| v.len() > 1)
+    }
+
+    /// Returns the size of the table that the hash function satisfies it's creation conditions with.
+    pub fn table_size(&self) -> usize {
+        self.tsize
+    }
+
+    /// Returns the keys the hash function used to build the table.
+    ///
+    /// These are returned in the same order as the [`SipHasher::new_with_keys`] function
+    ///
+    /// If you intend to use them to construct a new [`SipHasher`], use the [`BuildHasher`] impl.
+    pub const fn keys(&self) -> (u64, u64) {
+        (self.global_key, self.local_key)
+    }
+}
+
+impl<T, const C: usize, const D: usize> BuildHasher for HashFnStats<T, C, D> {
+    type Hasher = SipHasher<C, D>;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        SipHasher::new_with_keys(self.global_key, self.local_key)
+    }
+}
+
 /// Generates a near-perfect hash function for the elements of `vals`, based on a `global_key`.
 ///
 /// The return value is a pair of the set-specific key, and the minimum table size that allows the function to be unique when results are taken modulo this size.
@@ -18,12 +76,12 @@ use core::hash::{Hash, Hasher};
 ///
 /// This function assumes (but does not verify) that `vals` contains no duplicates. Unpredictable results may occur if duplicates appear in `vals`.
 ///
-pub fn gen_hash_fn<T: Hash, const C: usize, const D: usize>(
+pub fn gen_hash_fn<T: Hash + Clone, const C: usize, const D: usize>(
     vals: &[T],
     global_key: u64,
     density_threshold: f64,
     keys_per_step: usize,
-) -> (u64, usize) {
+) -> HashFnStats<T, C, D> {
     const SEED: u64 = 1138006940306161589;
     const MULTIPLIER: u64 = 4470274377298057907;
     const INC: u64 = 65537;
@@ -33,13 +91,13 @@ pub fn gen_hash_fn<T: Hash, const C: usize, const D: usize>(
         .checked_next_power_of_two()
         .expect("Table size overflowed");
 
-    let mut key = SEED.wrapping_add(global_key);
+    let mut local_key = SEED.wrapping_add(global_key);
 
-    loop {
+    'a: loop {
         for _ in 0..keys_per_step {
-            let mut counters = alloc::vec![0u32; tsize];
+            let mut counters = alloc::vec![0u32;tsize];
             for val in vals {
-                let mut hasher = SipHasher::<C, D>::new_with_keys(global_key, key);
+                let mut hasher = SipHasher::<C, D>::new_with_keys(global_key, local_key);
 
                 val.hash(&mut hasher);
 
@@ -58,12 +116,39 @@ pub fn gen_hash_fn<T: Hash, const C: usize, const D: usize>(
             let density = (collision_count as f64) / (tsize as f64);
 
             if density <= density_threshold {
-                return (key, tsize);
+                break 'a;
             }
 
-            key = key.wrapping_mul(MULTIPLIER).wrapping_add(INC);
+            local_key = local_key.wrapping_mul(MULTIPLIER).wrapping_add(INC);
         }
 
         tsize = tsize.checked_mul(2).expect("Table size overflowed");
+    }
+
+    let mut field_maps = alloc::vec![Vec::new();tsize];
+    let mut collision_count = 0u32;
+
+    for val in vals {
+        let mut hasher = SipHasher::<C, D>::new_with_keys(global_key, local_key);
+
+        val.hash(&mut hasher);
+
+        let hash = hasher.finish() as usize;
+
+        let idx = hash & (tsize - 1);
+
+        field_maps[idx].push(val.clone());
+
+        collision_count += (field_maps[idx].len() > 1) as u32;
+    }
+
+    let collision_density = (collision_count as f64) / (tsize as f64);
+
+    HashFnStats {
+        field_maps,
+        global_key,
+        local_key,
+        tsize,
+        collision_density,
     }
 }
